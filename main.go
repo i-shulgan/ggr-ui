@@ -65,8 +65,9 @@ func configure() error {
 		for _, b := range browsers.Browsers {
 			for _, v := range b.Versions {
 				for _, r := range v.Regions {
-					for _, h := range r.Hosts {
-						quota[h.Sum()] = &h
+					for i := range r.Hosts {
+						h := &r.Hosts[i]
+						quota[h.Sum()] = h
 					}
 				}
 			}
