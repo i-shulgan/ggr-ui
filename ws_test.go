@@ -105,13 +105,16 @@ func TestProxyWS(t *testing.T) {
 
 func TestProxyWSRejected(t *testing.T) {
 	host, sum, _ := newWSBackend(t, false)
-	setHosts(t, map[string]map[string]*config.Host{"unknown": {sum: host}})
+	down := NewSelenoid(nil)
+	down.Close()
+	setHosts(t, map[string]map[string]*config.Host{"unknown": {sum: host, down.Sum: down.Host}})
 	ggr := NewGGR()
 	defer ggr.Close()
 
 	for name, path := range map[string]string{
 		"ShortPath":   paths.VNC + "123",
 		"UnknownHost": paths.VNC + fmt.Sprintf("%x", md5.Sum([]byte("missing"))) + "123",
+		"HostDown":    paths.VNC + down.Sum + "123",
 	} {
 		t.Run(name, func(t *testing.T) {
 			conn := dialGGR(t, ggr, path)

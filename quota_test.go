@@ -36,7 +36,15 @@ func useQuotaDir(t *testing.T, dir string) {
 	t.Helper()
 	old := quotaDir
 	quotaDir = dir
-	t.Cleanup(func() { quotaDir = old })
+	lock.RLock()
+	oldHosts := hosts
+	lock.RUnlock()
+	t.Cleanup(func() {
+		quotaDir = old
+		lock.Lock()
+		hosts = oldHosts
+		lock.Unlock()
+	})
 	if err := configure(); err != nil {
 		t.Fatal(err)
 	}

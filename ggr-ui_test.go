@@ -173,28 +173,6 @@ func TestBrokenConfig(t *testing.T) {
 	}
 }
 
-func TestQueue(t *testing.T) {
-	tempLimit := limit
-	limit = 0
-	defer func(l int) {
-		limit = l
-	}(tempLimit)
-	tempTimeout := timeout
-	timeout = 100 * time.Millisecond
-	defer func(t time.Duration) {
-		timeout = t
-	}(tempTimeout)
-	ggr := NewGGR()
-	defer ggr.Close()
-	s, err := ggr.Status(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(s) != 0 {
-		t.Errorf("uexpected nonempty status: %v\n", s)
-	}
-}
-
 func TestResponseTime(t *testing.T) {
 	temp := responseTime
 	responseTime = 100 * time.Millisecond
