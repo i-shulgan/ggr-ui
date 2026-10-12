@@ -5,7 +5,7 @@ on:
     branches:
       - master
     tags:
-      - '*'
+      - 'v*'
   pull_request:
 
 permissions:
@@ -75,8 +75,30 @@ jobs:
           go run golang.org/x/vuln/cmd/govulncheck@latest ./...
           go run golang.org/x/vuln/cmd/govulncheck@latest -tags watch ./...
 
-  image:
+  release:
     needs: [lint, test, govulncheck]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Opens/updates the release PR from Conventional Commits on master and,
+      # once that PR is merged, creates the vX.Y.Z tag and GitHub release.
+      - id: release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  image:
+    needs: [lint, test, govulncheck, release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -100,7 +122,12 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,enable={{is_default_branch}}
-            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.tag_name }},enable=${{ needs.release.outputs.release_created == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release.outputs.tag_name }},enable=${{ needs.release.outputs.release_created == 'true' }}
+            type=semver,pattern={{major}},value=${{ needs.release.outputs.tag_name }},enable=${{ needs.release.outputs.release_created == 'true' }}
 
       - uses: docker/build-push-action@v6
         with:
@@ -109,7 +136,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            GIT_REVISION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+            GIT_REVISION=${{ needs.release.outputs.tag_name || (github.ref_type == 'tag' && github.ref_name) || github.sha }}
             BUILD_STAMP=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
