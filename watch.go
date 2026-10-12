@@ -1,4 +1,4 @@
-// +build watch
+//go:build watch
 
 package main
 
