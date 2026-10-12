@@ -6,6 +6,7 @@ require (
 	github.com/aandryashin/reloader v0.0.0-20161127125235-da4f1b43ce40
 	github.com/aerokube/ggr v0.0.0-20240107091226-64e83db61680
 	github.com/prometheus/client_golang v1.18.0
+	go.uber.org/goleak v1.3.0
 	golang.org/x/net v0.19.0
 )
 

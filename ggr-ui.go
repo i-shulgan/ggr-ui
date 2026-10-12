@@ -57,74 +57,70 @@ func status(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
-	ch := make(chan struct{}, limit)
-	rslt := make(chan *result)
-	done := make(chan Status)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	go func(ctx context.Context, quota map[string]*config.Host) {
+	// Buffered for every host so that pollers never block on send after
+	// the handler stopped collecting (response time exceeded or client gone).
+	rslt := make(chan *result, len(quota))
+	ch := make(chan struct{}, limit)
+	timeout := timeout
+	go func() {
 		for sum, h := range quota {
 			select {
 			case ch <- struct{}{}:
-				go func(ctx context.Context, sum string, h *config.Host) {
+				go func(sum string, h *config.Host) {
 					defer func() {
 						<-ch
 					}()
-					r, err := http.NewRequest(http.MethodGet, h.Route()+paths.Status, nil)
-					if err != nil {
-						rslt <- nil
-						log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
-						return
-					}
-					if h.Username != "" {
-						r.SetBasicAuth(h.Username, h.Password)
-					}
-					ctx, cancel := context.WithTimeout(ctx, timeout)
-					defer cancel()
-					resp, err := http.DefaultClient.Do(r.WithContext(ctx))
-					if err != nil {
-						rslt <- nil
-						log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
-						return
-					}
-					defer resp.Body.Close()
-					m := make(map[string]interface{})
-					err = json.NewDecoder(resp.Body).Decode(&m)
-					if err != nil {
-						rslt <- nil
-						log.Printf("[STATUS] [Failed to parse response: %v] [%s]", err, remote)
-						return
-					}
-					rslt <- &result{sum, m}
-				}(ctx, sum, h)
+					rslt <- fetchStatus(ctx, timeout, sum, h, remote)
+				}(sum, h)
 			case <-ctx.Done():
 				return
 			}
 		}
-	}(ctx, quota)
-	go func(ctx context.Context, quota map[string]*config.Host) {
-		s := make(Status)
-	loop:
-		for i := 0; i < len(quota); i++ {
-			select {
-			case result := <-rslt:
-				if result != nil && result.status != nil {
-					s.Add(result.sum, result.status)
-				}
-			case <-time.After(responseTime):
-				break loop
-			case <-ctx.Done():
-				return
+	}()
+	s := make(Status)
+loop:
+	for i := 0; i < len(quota); i++ {
+		select {
+		case result := <-rslt:
+			if result != nil && result.status != nil {
+				s.Add(result.sum, result.status)
 			}
+		case <-time.After(responseTime):
+			break loop
+		case <-ctx.Done():
+			return
 		}
-		done <- s
-	}(ctx, quota)
-	select {
-	case s := <-done:
-		w.Header().Add("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(s)
-	case <-r.Context().Done():
 	}
+	w.Header().Add("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s)
+}
+
+func fetchStatus(ctx context.Context, timeout time.Duration, sum string, h *config.Host, remote string) *result {
+	r, err := http.NewRequest(http.MethodGet, h.Route()+paths.Status, nil)
+	if err != nil {
+		log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
+		return nil
+	}
+	if h.Username != "" {
+		r.SetBasicAuth(h.Username, h.Password)
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := http.DefaultClient.Do(r.WithContext(ctx))
+	if err != nil {
+		log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
+		return nil
+	}
+	defer resp.Body.Close()
+	m := make(map[string]interface{})
+	err = json.NewDecoder(resp.Body).Decode(&m)
+	if err != nil {
+		log.Printf("[STATUS] [Failed to parse response: %v] [%s]", err, remote)
+		return nil
+	}
+	return &result{sum, m}
 }
 
 func userHosts(user string) (map[string]*config.Host, bool) {
