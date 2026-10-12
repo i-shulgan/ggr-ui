@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
@@ -18,6 +20,9 @@ import (
 )
 
 type Status map[string]interface{}
+
+// wsTLSConfig is used to dial wss:// hosts; nil means system defaults.
+var wsTLSConfig *tls.Config
 
 var paths = struct {
 	Status  string
@@ -195,14 +200,24 @@ func proxyWS(p string) func(wsconn *websocket.Conn) {
 			log.Printf("[WEBSOCKET] [Unknown host sum: %s] [%s]", sum, remote)
 			return
 		}
-		u, err := url.Parse(host.Route() + p + path[tail:])
+		raw := host.Route() + p + path[tail:]
+		u, err := url.Parse(raw)
 		if err != nil {
-			log.Printf("[WEBSOCKET] [Failed to parse url %s: %v] [%s]", u, err, remote)
+			log.Printf("[WEBSOCKET] [Failed to parse url %s: %v] [%s]", raw, err, remote)
 			return
 		}
-		u.Scheme = "ws"
+		u.Scheme = wsScheme(u.Scheme)
+		cfg, err := websocket.NewConfig(u.String(), "http://localhost")
+		if err != nil {
+			log.Printf("[WEBSOCKET] [Failed to configure websocket session to %s: %v] [%s]", u, err, remote)
+			return
+		}
+		cfg.TlsConfig = wsTLSConfig
+		if host.Username != "" {
+			cfg.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(host.Username+":"+host.Password)))
+		}
 		log.Printf("[WEBSOCKET] [Starting websocket session to %s] [%s]", u, remote)
-		conn, err := websocket.Dial(u.String(), "", "http://localhost")
+		conn, err := websocket.DialConfig(cfg)
 		if err != nil {
 			log.Printf("[WEBSOCKET] [Failed start websocket session to %s: %v] [%s]", u, err, remote)
 			return
@@ -217,6 +232,13 @@ func proxyWS(p string) func(wsconn *websocket.Conn) {
 		_, _ = io.Copy(conn, wsconn)
 		log.Printf("[WEBSOCKET] [Client disconnected: %s] [%s]", u, remote)
 	}
+}
+
+func wsScheme(scheme string) string {
+	if scheme == "https" {
+		return "wss"
+	}
+	return "ws"
 }
 
 func info(r *http.Request) (string, string) {
