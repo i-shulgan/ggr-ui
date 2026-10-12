@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // sessionsHandler emulates Selenoid /status with a single running session.
@@ -112,5 +113,47 @@ func TestQuotaSeveralHostsInRegion(t *testing.T) {
 		if n != 1 {
 			t.Errorf("session %s seen %d times, want 1", id, n)
 		}
+	}
+}
+
+// Quota reload must not wait for in-flight /status requests to finish.
+func TestReloadDuringSlowStatus(t *testing.T) {
+	setDuration(t, &timeout, 10*time.Second)
+	setDuration(t, &responseTime, 10*time.Second)
+
+	polled := make(chan struct{}, 1)
+	slow := NewSelenoid(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case polled <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+
+	dir := t.TempDir()
+	writeQuota(t, dir, "test", slow)
+	useQuotaDir(t, dir)
+
+	ggr := NewGGR()
+	defer ggr.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _, _ = ggr.Status(ctx) }()
+	select {
+	case <-polled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("status request did not reach the host")
+	}
+
+	reloaded := make(chan error, 1)
+	go func() { reloaded <- configure() }()
+	select {
+	case err := <-reloaded:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("quota reload is blocked by in-flight /status request")
 	}
 }

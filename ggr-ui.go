@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -48,8 +49,6 @@ type result struct {
 }
 
 func status(w http.ResponseWriter, r *http.Request) {
-	lock.RLock()
-	defer lock.RUnlock()
 	user, remote := info(r)
 	quota, ok := userHosts(user)
 	if !ok {
@@ -123,10 +122,15 @@ func fetchStatus(ctx context.Context, timeout time.Duration, sum string, h *conf
 	return &result{sum, m}
 }
 
+// userHosts returns a snapshot of hosts visible to user. The lock is held only
+// while copying, so slow network calls never delay quota reload. Hosts are
+// never mutated after configure() publishes them, so sharing pointers is safe.
 func userHosts(user string) (map[string]*config.Host, bool) {
+	lock.RLock()
+	defer lock.RUnlock()
 	if authenticatedAccessOnly {
 		quota, ok := hosts[user]
-		return quota, ok
+		return maps.Clone(quota), ok
 	}
 
 	ret := make(map[string]*config.Host)
@@ -181,16 +185,12 @@ func proxyWS(p string) func(wsconn *websocket.Conn) {
 			return
 		}
 		sum := path[head:tail]
-		lock.RLock()
 		quota, ok := userHosts(user)
-		lock.RUnlock()
 		if !ok {
 			log.Printf("[WEBSOCKET] [Unknown quota user: %s] [%s]", user, remote)
 			return
 		}
-		lock.RLock()
 		host, ok := quota[sum]
-		lock.RUnlock()
 		if !ok {
 			log.Printf("[WEBSOCKET] [Unknown host sum: %s] [%s]", sum, remote)
 			return
