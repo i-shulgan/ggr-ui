@@ -2,11 +2,11 @@
 
 To build Ggr UI:
 
-. Install https://golang.org/doc/install[Golang] 1.11 and above.
+. Install https://golang.org/doc/install[Golang] 1.27.2 and above.
 
 . Close Ggr UI source:
 
-    $ git clone https://github.com/aerokube/ggr-ui.git
+    $ git clone https://github.com/i-shulgan/ggr-ui.git
 
 . Go to project directory:
 
@@ -29,7 +29,6 @@ To build Docker container type:
 
 [source,bash]
 ----
-$ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build
 $ docker build -t ggr-ui:latest .
 ----
 

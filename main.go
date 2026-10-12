@@ -65,8 +65,9 @@ func configure() error {
 		for _, b := range browsers.Browsers {
 			for _, v := range b.Versions {
 				for _, r := range v.Regions {
-					for _, h := range r.Hosts {
-						quota[h.Sum()] = &h
+					for i := range r.Hosts {
+						h := &r.Hosts[i]
+						quota[h.Sum()] = h
 					}
 				}
 			}
@@ -81,6 +82,9 @@ func configure() error {
 	return nil
 }
 
+// startWatcher is replaced by the watch build tag to reload quota on file changes.
+var startWatcher = func() {}
+
 func init() {
 	flag.BoolVar(&authenticatedAccessOnly, "authenticated-access-only", false, "Show statistics about all hosts only when credentials are provided")
 	flag.BoolVar(&guestAccessAllowed, "guests-allowed", false, "Allow guest (unauthenticated) users to access the grid")
@@ -92,33 +96,34 @@ func init() {
 	flag.StringVar(&quotaDir, "quota-dir", "quota", "quota directory")
 	flag.DurationVar(&gracePeriod, "grace-period", 300*time.Second, "graceful shutdown period")
 	flag.BoolVar(&version, "version", false, "Show version and exit")
-	flag.Parse()
+}
 
+// reloadOnSignal reloads quota on every received signal until sig is closed.
+func reloadOnSignal(sig <-chan os.Signal) {
+	for range sig {
+		if err := configure(); err != nil {
+			log.Printf("[INIT] [Failed to reload quota files: %v]", err)
+		}
+	}
+}
+
+func main() {
+	flag.Parse()
 	if version {
 		showVersion()
 		os.Exit(0)
 	}
 
-	err := configure()
-	if err != nil {
+	if err := configure(); err != nil {
 		log.Fatalf("[INIT] [Failed to load quota files: %v]", err)
 	}
+	startWatcher()
 
-	sig := make(chan os.Signal)
-	signal.Notify(sig, syscall.SIGHUP)
-	go func() {
-		for {
-			<-sig
-			err := configure()
-			if err != nil {
-				log.Printf("[INIT] [Failed to reload quota files: %v]", err)
-			}
-		}
-	}()
-}
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	go reloadOnSignal(reload)
 
-func main() {
-	stop := make(chan os.Signal)
+	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	log.Printf("[INIT] [Listen on %s]", listen)
@@ -126,7 +131,7 @@ func main() {
 		Addr:    listen,
 		Handler: mux(),
 	}
-	e := make(chan error)
+	e := make(chan error, 1)
 	go func() {
 		e <- server.ListenAndServe()
 	}()

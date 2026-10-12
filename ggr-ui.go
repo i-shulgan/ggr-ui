@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -17,6 +20,9 @@ import (
 )
 
 type Status map[string]interface{}
+
+// wsTLSConfig is used to dial wss:// hosts; nil means system defaults.
+var wsTLSConfig *tls.Config
 
 var paths = struct {
 	Status  string
@@ -48,8 +54,6 @@ type result struct {
 }
 
 func status(w http.ResponseWriter, r *http.Request) {
-	lock.RLock()
-	defer lock.RUnlock()
 	user, remote := info(r)
 	quota, ok := userHosts(user)
 	if !ok {
@@ -57,80 +61,81 @@ func status(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
-	ch := make(chan struct{}, limit)
-	rslt := make(chan *result)
-	done := make(chan Status)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	go func(ctx context.Context, quota map[string]*config.Host) {
+	// Buffered for every host so that pollers never block on send after
+	// the handler stopped collecting (response time exceeded or client gone).
+	rslt := make(chan *result, len(quota))
+	ch := make(chan struct{}, limit)
+	timeout := timeout
+	go func() {
 		for sum, h := range quota {
 			select {
 			case ch <- struct{}{}:
-				go func(ctx context.Context, sum string, h *config.Host) {
+				go func(sum string, h *config.Host) {
 					defer func() {
 						<-ch
 					}()
-					r, err := http.NewRequest(http.MethodGet, h.Route()+paths.Status, nil)
-					if err != nil {
-						rslt <- nil
-						log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
-						return
-					}
-					if h.Username != "" {
-						r.SetBasicAuth(h.Username, h.Password)
-					}
-					ctx, cancel := context.WithTimeout(ctx, timeout)
-					defer cancel()
-					resp, err := http.DefaultClient.Do(r.WithContext(ctx))
-					if err != nil {
-						rslt <- nil
-						log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
-						return
-					}
-					defer resp.Body.Close()
-					m := make(map[string]interface{})
-					err = json.NewDecoder(resp.Body).Decode(&m)
-					if err != nil {
-						rslt <- nil
-						log.Printf("[STATUS] [Failed to parse response: %v] [%s]", err, remote)
-						return
-					}
-					rslt <- &result{sum, m}
-				}(ctx, sum, h)
+					rslt <- fetchStatus(ctx, timeout, sum, h, remote)
+				}(sum, h)
 			case <-ctx.Done():
 				return
 			}
 		}
-	}(ctx, quota)
-	go func(ctx context.Context, quota map[string]*config.Host) {
-		s := make(Status)
-	loop:
-		for i := 0; i < len(quota); i++ {
-			select {
-			case result := <-rslt:
-				if result != nil && result.status != nil {
-					s.Add(result.sum, result.status)
-				}
-			case <-time.After(responseTime):
-				break loop
-			case <-ctx.Done():
-				return
+	}()
+	s := make(Status)
+loop:
+	for i := 0; i < len(quota); i++ {
+		select {
+		case result := <-rslt:
+			if result != nil && result.status != nil {
+				s.Add(result.sum, result.status)
 			}
+		case <-time.After(responseTime):
+			break loop
+		case <-ctx.Done():
+			return
 		}
-		done <- s
-	}(ctx, quota)
-	select {
-	case s := <-done:
-		w.Header().Add("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(s)
-	case <-r.Context().Done():
 	}
+	w.Header().Add("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s)
 }
 
+func fetchStatus(ctx context.Context, timeout time.Duration, sum string, h *config.Host, remote string) *result {
+	r, err := http.NewRequest(http.MethodGet, h.Route()+paths.Status, nil)
+	if err != nil {
+		log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
+		return nil
+	}
+	if h.Username != "" {
+		r.SetBasicAuth(h.Username, h.Password)
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := http.DefaultClient.Do(r.WithContext(ctx))
+	if err != nil {
+		log.Printf("[STATUS] [Failed to fetch status: %v] [%s]", err, remote)
+		return nil
+	}
+	defer resp.Body.Close()
+	m := make(map[string]interface{})
+	err = json.NewDecoder(resp.Body).Decode(&m)
+	if err != nil {
+		log.Printf("[STATUS] [Failed to parse response: %v] [%s]", err, remote)
+		return nil
+	}
+	return &result{sum, m}
+}
+
+// userHosts returns a snapshot of hosts visible to user. The lock is held only
+// while copying, so slow network calls never delay quota reload. Hosts are
+// never mutated after configure() publishes them, so sharing pointers is safe.
 func userHosts(user string) (map[string]*config.Host, bool) {
+	lock.RLock()
+	defer lock.RUnlock()
 	if authenticatedAccessOnly {
 		quota, ok := hosts[user]
-		return quota, ok
+		return maps.Clone(quota), ok
 	}
 
 	ret := make(map[string]*config.Host)
@@ -185,28 +190,34 @@ func proxyWS(p string) func(wsconn *websocket.Conn) {
 			return
 		}
 		sum := path[head:tail]
-		lock.RLock()
 		quota, ok := userHosts(user)
-		lock.RUnlock()
 		if !ok {
 			log.Printf("[WEBSOCKET] [Unknown quota user: %s] [%s]", user, remote)
 			return
 		}
-		lock.RLock()
 		host, ok := quota[sum]
-		lock.RUnlock()
 		if !ok {
 			log.Printf("[WEBSOCKET] [Unknown host sum: %s] [%s]", sum, remote)
 			return
 		}
-		u, err := url.Parse(host.Route() + p + path[tail:])
+		raw := host.Route() + p + path[tail:]
+		u, err := url.Parse(raw)
 		if err != nil {
-			log.Printf("[WEBSOCKET] [Failed to parse url %s: %v] [%s]", u, err, remote)
+			log.Printf("[WEBSOCKET] [Failed to parse url %s: %v] [%s]", raw, err, remote)
 			return
 		}
-		u.Scheme = "ws"
+		u.Scheme = wsScheme(u.Scheme)
+		cfg, err := websocket.NewConfig(u.String(), "http://localhost")
+		if err != nil {
+			log.Printf("[WEBSOCKET] [Failed to configure websocket session to %s: %v] [%s]", u, err, remote)
+			return
+		}
+		cfg.TlsConfig = wsTLSConfig
+		if host.Username != "" {
+			cfg.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(host.Username+":"+host.Password)))
+		}
 		log.Printf("[WEBSOCKET] [Starting websocket session to %s] [%s]", u, remote)
-		conn, err := websocket.Dial(u.String(), "", "http://localhost")
+		conn, err := websocket.DialConfig(cfg)
 		if err != nil {
 			log.Printf("[WEBSOCKET] [Failed start websocket session to %s: %v] [%s]", u, err, remote)
 			return
@@ -221,6 +232,13 @@ func proxyWS(p string) func(wsconn *websocket.Conn) {
 		_, _ = io.Copy(conn, wsconn)
 		log.Printf("[WEBSOCKET] [Client disconnected: %s] [%s]", u, remote)
 	}
+}
+
+func wsScheme(scheme string) string {
+	if scheme == "https" {
+		return "wss"
+	}
+	return "ws"
 }
 
 func info(r *http.Request) (string, string) {
